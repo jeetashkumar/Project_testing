@@ -21,16 +21,16 @@ from requests.auth import HTTPDigestAuth
 # ============================================================
 
 # Hikvision camera configuration
-CAMERA_IP = "192.168.2.108"
+CAMERA_IP = "192.168.137.83"
 CAMERA_USER = "admin"
-CAMERA_PASS = "YOUR_CAMERA_PASSWORD"
+CAMERA_PASS = "NCAI#456"
 
 CAMERA_URL = (
     f"http://{CAMERA_IP}/ISAPI/Streaming/channels/101/picture"
 )
 
 # Cattle-monitoring FastAPI backend
-BACKEND_BASE_URL = "https://backend.rcai.com.pk"
+BACKEND_BASE_URL = "http://192.168.137.219:8000"
 
 # Camera ID registered in the cattle-monitoring database
 CAMERA_ID = "HYDERABAD"
