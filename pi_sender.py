@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 
 import time
@@ -20,10 +19,10 @@ from requests.auth import HTTPDigestAuth
 # CONFIGURATION
 # ============================================================
 
-# Hikvision camera configuration
+# Hikvision camera
 CAMERA_IP = "192.168.137.83"
 CAMERA_USER = "admin"
-CAMERA_PASS = "NCAI#456"
+CAMERA_PASS = "PUT_YOUR_NEW_CAMERA_PASSWORD_HERE"
 
 CAMERA_URL = (
     f"http://{CAMERA_IP}/ISAPI/Streaming/channels/101/picture"
@@ -32,24 +31,28 @@ CAMERA_URL = (
 # Cattle-monitoring FastAPI backend
 BACKEND_BASE_URL = "http://192.168.137.219:8000"
 
-# Camera ID registered in the cattle-monitoring database
+# Must match the camera_id registered in FastAPI
 CAMERA_ID = "camera_test_01"
 
-# Snapshot upload interval (seconds)
+# Capture one snapshot every 5 seconds
 SNAPSHOT_INTERVAL = 5
 
-# Raspberry Pi heartbeat interval (seconds)
+# Raspberry Pi heartbeat interval
 STATUS_INTERVAL = 60
 
-# HTTP request timeouts
+# Enable this only after /api/pi_status is implemented
+# in your FastAPI backend.
+SEND_HEARTBEAT = False
+
+# Request timeouts
 CAMERA_TIMEOUT = 10
 SESSION_TIMEOUT = 20
 HEARTBEAT_TIMEOUT = 10
 
-# Frame upload timeout: (connection timeout, read timeout)
+# (connection timeout, read timeout)
 FRAME_UPLOAD_TIMEOUT = (10, 60)
 
-# Flask local preview configuration
+# Local Flask preview
 FLASK_HOST = "0.0.0.0"
 FLASK_PORT = 5001
 
@@ -58,9 +61,7 @@ FLASK_PORT = 5001
 # API ENDPOINTS
 # ============================================================
 
-HEALTH_URL = (
-    f"{BACKEND_BASE_URL}/health"
-)
+HEALTH_URL = f"{BACKEND_BASE_URL}/health"
 
 CREATE_SESSION_URL = (
     f"{BACKEND_BASE_URL}/api/v1/sessions"
@@ -80,16 +81,27 @@ app = Flask(__name__)
 latest_snapshot = None
 snapshot_lock = threading.Lock()
 
+# Protect sequence number if more upload threads are added later.
+sequence_lock = threading.Lock()
+
 camera_connection_failed = False
 snapshot_upload_failed = False
 
 session_id = None
+
+# Reset to zero whenever a new session is created.
 sequence_number = 0
 
-running = True
+# Used to stop background threads.
+stop_event = threading.Event()
 
-# Reuse HTTP connections to the backend
+# Reuse backend HTTP connections.
 backend_session = requests.Session()
+
+
+# ============================================================
+# LOGGING
+# ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -140,7 +152,7 @@ def check_backend():
 
 
 # ============================================================
-# 2. CREATE CATTLE MONITORING SESSION
+# 2. CREATE MONITORING SESSION
 # ============================================================
 
 def create_monitoring_session():
@@ -172,9 +184,9 @@ def create_monitoring_session():
 
         result = response.json()
 
-        session_id = result.get("session_id")
+        new_session_id = result.get("session_id")
 
-        if not session_id:
+        if not new_session_id:
 
             log.error(
                 "Backend did not return session_id: %s",
@@ -183,7 +195,11 @@ def create_monitoring_session():
 
             return False
 
-        sequence_number = 0
+        # Reset sequence only after successfully creating a new session.
+        with sequence_lock:
+
+            session_id = new_session_id
+            sequence_number = 0
 
         log.info(
             "Monitoring session created successfully: %s",
@@ -203,7 +219,22 @@ def create_monitoring_session():
 
 
 # ============================================================
-# 3. GET RASPBERRY PI HEALTH INFORMATION
+# 3. GET NEXT SEQUENCE NUMBER
+# ============================================================
+
+def get_next_sequence_number():
+
+    global sequence_number
+
+    with sequence_lock:
+
+        sequence_number += 1
+
+        return sequence_number
+
+
+# ============================================================
+# 4. GET RASPBERRY PI HEALTH INFORMATION
 # ============================================================
 
 def get_pi_status():
@@ -282,10 +313,13 @@ def get_pi_status():
 
 
 # ============================================================
-# 4. SEND RASPBERRY PI HEARTBEAT
+# 5. SEND RASPBERRY PI HEARTBEAT
 # ============================================================
 
 def send_pi_status():
+
+    if not SEND_HEARTBEAT:
+        return
 
     try:
 
@@ -320,7 +354,7 @@ def send_pi_status():
 
 
 # ============================================================
-# 5. CAPTURE HIKVISION CAMERA SNAPSHOT
+# 6. CAPTURE HIKVISION CAMERA SNAPSHOT
 # ============================================================
 
 def capture_snapshot():
@@ -367,7 +401,7 @@ def capture_snapshot():
 
         camera_connection_failed = False
 
-        # Store the latest snapshot for local Flask preview
+        # Save latest image for Flask preview.
         with snapshot_lock:
 
             latest_snapshot = image_bytes
@@ -403,12 +437,11 @@ def capture_snapshot():
 
 
 # ============================================================
-# 6. UPLOAD FRAME TO CATTLE MONITORING BACKEND
+# 7. UPLOAD FRAME TO FASTAPI
 # ============================================================
 
 def upload_frame(image_bytes):
 
-    global sequence_number
     global snapshot_upload_failed
 
     if not session_id:
@@ -421,6 +454,10 @@ def upload_frame(image_bytes):
 
         return False
 
+    # Reserve a NEW sequence number before the request.
+    # Do not reuse it if the request fails or times out.
+    current_sequence = get_next_sequence_number()
+
     frame_timestamp = time.time()
 
     upload_url = (
@@ -431,22 +468,21 @@ def upload_frame(image_bytes):
     files = {
 
         "file": (
-
             "hikvision_snapshot.jpg",
-
             image_bytes,
-
             "image/jpeg"
-
         )
 
     }
 
-    data = {
+    # IMPORTANT:
+    # FastAPI expects timestamp and sequence_number
+    # as QUERY PARAMETERS, not multipart form fields.
+    params = {
 
-        "timestamp": str(frame_timestamp),
+        "timestamp": frame_timestamp,
 
-        "sequence_number": str(sequence_number)
+        "sequence_number": current_sequence
 
     }
 
@@ -455,11 +491,10 @@ def upload_frame(image_bytes):
         response = backend_session.post(
             upload_url,
             files=files,
-            data=data,
+            params=params,
             timeout=FRAME_UPLOAD_TIMEOUT
         )
 
-        # Backend accepted the frame
         if response.status_code == 202:
 
             snapshot_upload_failed = False
@@ -468,20 +503,26 @@ def upload_frame(image_bytes):
                 "Frame accepted | Camera: %s | Session: %s | Sequence: %s",
                 CAMERA_ID,
                 session_id,
-                sequence_number
+                current_sequence
             )
-
-            sequence_number += 1
 
             return True
 
         snapshot_upload_failed = True
 
         log.error(
-            "Frame upload failed | HTTP %s | Response: %s",
+            "Frame upload failed | HTTP %s | Sequence: %s | Response: %s",
             response.status_code,
+            current_sequence,
             response.text
         )
+
+        if response.status_code == 409:
+
+            log.error(
+                "Sequence conflict. The current session may have "
+                "already received a higher sequence number."
+            )
 
         return False
 
@@ -490,7 +531,8 @@ def upload_frame(image_bytes):
         snapshot_upload_failed = True
 
         log.error(
-            "Frame upload connection error: %s",
+            "Frame upload connection error | Sequence: %s | %s",
+            current_sequence,
             exc
         )
 
@@ -498,12 +540,16 @@ def upload_frame(image_bytes):
 
 
 # ============================================================
-# 7. SNAPSHOT BACKGROUND LOOP
+# 8. SNAPSHOT BACKGROUND LOOP
 # ============================================================
 
 def snapshot_loop():
 
-    while running:
+    log.info(
+        "Snapshot background loop started"
+    )
+
+    while not stop_event.is_set():
 
         try:
 
@@ -519,16 +565,24 @@ def snapshot_loop():
                 "Snapshot background loop error"
             )
 
-        time.sleep(SNAPSHOT_INTERVAL)
+        stop_event.wait(SNAPSHOT_INTERVAL)
+
+    log.info(
+        "Snapshot background loop stopped"
+    )
 
 
 # ============================================================
-# 8. RASPBERRY PI STATUS BACKGROUND LOOP
+# 9. RASPBERRY PI STATUS BACKGROUND LOOP
 # ============================================================
 
 def status_loop():
 
-    while running:
+    log.info(
+        "Status background loop started"
+    )
+
+    while not stop_event.is_set():
 
         try:
 
@@ -540,11 +594,15 @@ def status_loop():
                 "Status background loop error"
             )
 
-        time.sleep(STATUS_INTERVAL)
+        stop_event.wait(STATUS_INTERVAL)
+
+    log.info(
+        "Status background loop stopped"
+    )
 
 
 # ============================================================
-# 9. FINISH MONITORING SESSION
+# 10. FINISH MONITORING SESSION
 # ============================================================
 
 def finish_monitoring_session():
@@ -589,7 +647,7 @@ def finish_monitoring_session():
 
 
 # ============================================================
-# 10. FLASK LOCAL SNAPSHOT PREVIEW
+# 11. FLASK LOCAL SNAPSHOT PREVIEW
 # ============================================================
 
 @app.route("/snapshot")
@@ -610,11 +668,15 @@ def get_snapshot():
 
 
 # ============================================================
-# 11. FLASK LOCAL SENDER STATUS
+# 12. FLASK LOCAL SENDER STATUS
 # ============================================================
 
 @app.route("/status")
 def local_status():
+
+    with sequence_lock:
+
+        current_sequence = sequence_number
 
     return {
 
@@ -622,17 +684,21 @@ def local_status():
 
         "session_id": session_id,
 
-        "sequence_number": sequence_number,
+        "sequence_number": current_sequence,
 
         "camera_connection_failed": camera_connection_failed,
 
         "snapshot_upload_failed": snapshot_upload_failed,
 
+        "heartbeat_enabled": SEND_HEARTBEAT,
+
+        "running": not stop_event.is_set()
+
     }
 
 
 # ============================================================
-# 12. MAIN
+# 13. MAIN
 # ============================================================
 
 if __name__ == "__main__":
@@ -662,18 +728,20 @@ if __name__ == "__main__":
     )
 
     log.info(
-        "Heartbeat interval: %s seconds",
-        STATUS_INTERVAL
+        "Heartbeat enabled: %s",
+        SEND_HEARTBEAT
     )
 
-    if not CAMERA_PASS or CAMERA_PASS == "YOUR_CAMERA_PASSWORD":
+    if (
+        not CAMERA_PASS
+        or CAMERA_PASS == "PUT_YOUR_NEW_CAMERA_PASSWORD_HERE"
+    ):
 
         raise RuntimeError(
-            "Please enter your Hikvision camera password "
-            "in CAMERA_PASS."
+            "Please configure your Hikvision camera password."
         )
 
-    # Check backend connectivity
+    # Check backend connectivity.
     if not check_backend():
 
         raise RuntimeError(
@@ -681,7 +749,7 @@ if __name__ == "__main__":
             "Check the backend URL and server."
         )
 
-    # Create a monitoring session
+    # Create a monitoring session.
     if not create_monitoring_session():
 
         raise RuntimeError(
@@ -689,20 +757,21 @@ if __name__ == "__main__":
             "Verify that the camera is registered and enabled."
         )
 
-    # Start snapshot sender thread
+    # Start snapshot sender thread.
     snapshot_thread = threading.Thread(
         target=snapshot_loop,
-        daemon=True
+        daemon=True,
+        name="snapshot-sender"
     )
 
-    # Start heartbeat thread
+    # Start heartbeat thread.
     status_thread = threading.Thread(
         target=status_loop,
-        daemon=True
+        daemon=True,
+        name="pi-status"
     )
 
     snapshot_thread.start()
-
     status_thread.start()
 
     log.info(
@@ -726,12 +795,11 @@ if __name__ == "__main__":
 
     finally:
 
-        running = False
+        stop_event.set()
 
-        # Allow background loops to stop before closing HTTP session
-        snapshot_thread.join(timeout=10)
-
-        status_thread.join(timeout=10)
+        # Allow background loops to stop.
+        snapshot_thread.join(timeout=15)
+        status_thread.join(timeout=15)
 
         finish_monitoring_session()
 
