@@ -22,7 +22,7 @@ from requests.auth import HTTPDigestAuth
 # Hikvision camera
 CAMERA_IP = "192.168.137.83"
 CAMERA_USER = "admin"
-CAMERA_PASS = "PUT_YOUR_NEW_CAMERA_PASSWORD_HERE"
+CAMERA_PASS = "NCAI#456"
 
 CAMERA_URL = (
     f"http://{CAMERA_IP}/ISAPI/Streaming/channels/101/picture"
