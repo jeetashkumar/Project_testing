@@ -1,13 +1,11 @@
 
 #!/usr/bin/env python3
 
-import os
 import time
 import platform
 import threading
 import logging
 from datetime import datetime
-from pathlib import Path
 
 import requests
 import psutil
@@ -22,29 +20,36 @@ from requests.auth import HTTPDigestAuth
 # CONFIGURATION
 # ============================================================
 
-CAMERA_IP = os.getenv("CAMERA_IP", "192.168.2.108")
-CAMERA_USER = os.getenv("CAMERA_USER", "admin")
-CAMERA_PASS = os.getenv("CAMERA_PASS", "")
+# Hikvision camera configuration
+CAMERA_IP = "192.168.2.108"
+CAMERA_USER = "admin"
+CAMERA_PASS = "YOUR_CAMERA_PASSWORD"
 
 CAMERA_URL = (
     f"http://{CAMERA_IP}/ISAPI/Streaming/channels/101/picture"
 )
 
-# Cattle-monitoring FastAPI server
-BACKEND_BASE_URL = os.getenv(
-    "BACKEND_BASE_URL",
-    "https://backend.rcai.com.pk"
-).rstrip("/")
+# Cattle-monitoring FastAPI backend
+BACKEND_BASE_URL = "https://backend.rcai.com.pk"
 
-# This ID must already exist and be enabled in the cattle backend.
-CAMERA_ID = os.getenv("CAMERA_ID", "HYDERABAD")
+# Camera ID registered in the cattle-monitoring database
+CAMERA_ID = "HYDERABAD"
 
+# Snapshot upload interval (seconds)
 SNAPSHOT_INTERVAL = 5
+
+# Raspberry Pi heartbeat interval (seconds)
 STATUS_INTERVAL = 60
 
-REQUEST_TIMEOUT = (10, 60)
+# HTTP request timeouts
+CAMERA_TIMEOUT = 10
+SESSION_TIMEOUT = 20
+HEARTBEAT_TIMEOUT = 10
 
-# Flask preview
+# Frame upload timeout: (connection timeout, read timeout)
+FRAME_UPLOAD_TIMEOUT = (10, 60)
+
+# Flask local preview configuration
 FLASK_HOST = "0.0.0.0"
 FLASK_PORT = 5001
 
@@ -53,11 +58,17 @@ FLASK_PORT = 5001
 # API ENDPOINTS
 # ============================================================
 
-HEALTH_URL = f"{BACKEND_BASE_URL}/health"
+HEALTH_URL = (
+    f"{BACKEND_BASE_URL}/health"
+)
 
-CREATE_SESSION_URL = f"{BACKEND_BASE_URL}/api/v1/sessions"
+CREATE_SESSION_URL = (
+    f"{BACKEND_BASE_URL}/api/v1/sessions"
+)
 
-HEARTBEAT_URL = f"{BACKEND_BASE_URL}/api/pi_status"
+HEARTBEAT_URL = (
+    f"{BACKEND_BASE_URL}/api/pi_status"
+)
 
 
 # ============================================================
@@ -77,6 +88,9 @@ sequence_number = 0
 
 running = True
 
+# Reuse HTTP connections to the backend
+backend_session = requests.Session()
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
@@ -84,16 +98,15 @@ logging.basicConfig(
 
 log = logging.getLogger("cattle-pi-sender")
 
-backend_session = requests.Session()
-
 
 # ============================================================
-# 1. CHECK BACKEND
+# 1. CHECK BACKEND CONNECTION
 # ============================================================
 
 def check_backend():
 
     try:
+
         response = backend_session.get(
             HEALTH_URL,
             timeout=10
@@ -103,16 +116,25 @@ def check_backend():
 
         result = response.json()
 
-        log.info("Backend connection successful: %s", result)
+        log.info(
+            "Backend connection successful: %s",
+            result
+        )
 
         if not result.get("models_loaded", False):
-            log.warning("Backend is running, but models are not loaded.")
+
+            log.warning(
+                "Backend is running, but ML models are not loaded."
+            )
 
         return True
 
     except requests.RequestException as exc:
 
-        log.error("Backend connection failed: %s", exc)
+        log.error(
+            "Backend connection failed: %s",
+            exc
+        )
 
         return False
 
@@ -135,13 +157,13 @@ def create_monitoring_session():
         response = backend_session.post(
             CREATE_SESSION_URL,
             json=payload,
-            timeout=20
+            timeout=SESSION_TIMEOUT
         )
 
         if response.status_code not in (200, 201):
 
             log.error(
-                "Session creation failed: HTTP %s - %s",
+                "Session creation failed | HTTP %s | %s",
                 response.status_code,
                 response.text
             )
@@ -163,25 +185,32 @@ def create_monitoring_session():
 
         sequence_number = 0
 
-        log.info("Cattle monitoring session created: %s", session_id)
+        log.info(
+            "Monitoring session created successfully: %s",
+            session_id
+        )
 
         return True
 
     except requests.RequestException as exc:
 
-        log.error("Session creation error: %s", exc)
+        log.error(
+            "Session creation error: %s",
+            exc
+        )
 
         return False
 
 
 # ============================================================
-# 3. GET RASPBERRY PI STATUS
+# 3. GET RASPBERRY PI HEALTH INFORMATION
 # ============================================================
 
 def get_pi_status():
 
     try:
 
+        # CPU temperature
         cpu_temp = "N/A"
 
         try:
@@ -197,9 +226,10 @@ def get_pi_status():
                 )
 
         except (OSError, ValueError):
+
             pass
 
-        return {
+        status = {
 
             "camera_id": CAMERA_ID,
 
@@ -232,50 +262,65 @@ def get_pi_status():
 
         }
 
+        return status
+
     except Exception as exc:
 
-        log.exception("Unable to collect Pi status")
+        log.exception(
+            "Unable to collect Raspberry Pi status"
+        )
 
         return {
+
             "camera_id": CAMERA_ID,
+
             "status": "error",
+
             "error": str(exc)
+
         }
 
 
 # ============================================================
-# 4. SEND PI HEARTBEAT
+# 4. SEND RASPBERRY PI HEARTBEAT
 # ============================================================
 
 def send_pi_status():
 
     try:
 
+        status = get_pi_status()
+
         response = backend_session.post(
             HEARTBEAT_URL,
-            json=get_pi_status(),
-            timeout=10
+            json=status,
+            timeout=HEARTBEAT_TIMEOUT
         )
 
         if response.status_code == 200:
 
-            log.info("Pi heartbeat sent successfully")
+            log.info(
+                "Raspberry Pi heartbeat sent successfully"
+            )
 
         else:
 
             log.warning(
-                "Heartbeat failed: HTTP %s - %s",
+                "Heartbeat failed | HTTP %s | %s",
                 response.status_code,
                 response.text
             )
 
     except requests.RequestException as exc:
 
-        log.error("Heartbeat connection error: %s", exc)
+        log.error(
+            "Heartbeat connection error: %s",
+            exc
+        )
 
 
 # ============================================================
-# 5. CAPTURE HIKVISION SNAPSHOT
+# 5. CAPTURE HIKVISION CAMERA SNAPSHOT
 # ============================================================
 
 def capture_snapshot():
@@ -287,11 +332,13 @@ def capture_snapshot():
 
         response = requests.get(
             CAMERA_URL,
+
             auth=HTTPDigestAuth(
                 CAMERA_USER,
                 CAMERA_PASS
             ),
-            timeout=10
+
+            timeout=CAMERA_TIMEOUT
         )
 
         response.raise_for_status()
@@ -312,15 +359,24 @@ def capture_snapshot():
 
             camera_connection_failed = True
 
-            log.warning("Invalid image received from camera")
+            log.warning(
+                "Invalid image received from Hikvision camera"
+            )
 
             return None
 
         camera_connection_failed = False
 
+        # Store the latest snapshot for local Flask preview
         with snapshot_lock:
 
             latest_snapshot = image_bytes
+
+        log.info(
+            "Camera snapshot captured: %s x %s",
+            frame.shape[1],
+            frame.shape[0]
+        )
 
         return image_bytes
 
@@ -328,7 +384,10 @@ def capture_snapshot():
 
         camera_connection_failed = True
 
-        log.error("Camera connection error: %s", exc)
+        log.error(
+            "Camera connection error: %s",
+            exc
+        )
 
         return None
 
@@ -336,13 +395,15 @@ def capture_snapshot():
 
         camera_connection_failed = True
 
-        log.exception("Snapshot capture error")
+        log.exception(
+            "Snapshot capture error"
+        )
 
         return None
 
 
 # ============================================================
-# 6. UPLOAD FRAME TO CATTLE MONITORING API
+# 6. UPLOAD FRAME TO CATTLE MONITORING BACKEND
 # ============================================================
 
 def upload_frame(image_bytes):
@@ -352,7 +413,9 @@ def upload_frame(image_bytes):
 
     if not session_id:
 
-        log.error("No active monitoring session")
+        log.error(
+            "No active cattle-monitoring session"
+        )
 
         snapshot_upload_failed = True
 
@@ -368,9 +431,13 @@ def upload_frame(image_bytes):
     files = {
 
         "file": (
+
             "hikvision_snapshot.jpg",
+
             image_bytes,
+
             "image/jpeg"
+
         )
 
     }
@@ -389,16 +456,17 @@ def upload_frame(image_bytes):
             upload_url,
             files=files,
             data=data,
-            timeout=REQUEST_TIMEOUT
+            timeout=FRAME_UPLOAD_TIMEOUT
         )
 
-        # The cattle backend accepts frames with HTTP 202.
+        # Backend accepted the frame
         if response.status_code == 202:
 
             snapshot_upload_failed = False
 
             log.info(
-                "Frame accepted | Session: %s | Sequence: %s",
+                "Frame accepted | Camera: %s | Session: %s | Sequence: %s",
+                CAMERA_ID,
                 session_id,
                 sequence_number
             )
@@ -410,7 +478,7 @@ def upload_frame(image_bytes):
         snapshot_upload_failed = True
 
         log.error(
-            "Frame upload failed | HTTP %s | %s",
+            "Frame upload failed | HTTP %s | Response: %s",
             response.status_code,
             response.text
         )
@@ -421,7 +489,10 @@ def upload_frame(image_bytes):
 
         snapshot_upload_failed = True
 
-        log.error("Frame upload connection error: %s", exc)
+        log.error(
+            "Frame upload connection error: %s",
+            exc
+        )
 
         return False
 
@@ -444,13 +515,15 @@ def snapshot_loop():
 
         except Exception:
 
-            log.exception("Snapshot loop error")
+            log.exception(
+                "Snapshot background loop error"
+            )
 
         time.sleep(SNAPSHOT_INTERVAL)
 
 
 # ============================================================
-# 8. STATUS BACKGROUND LOOP
+# 8. RASPBERRY PI STATUS BACKGROUND LOOP
 # ============================================================
 
 def status_loop():
@@ -463,7 +536,9 @@ def status_loop():
 
         except Exception:
 
-            log.exception("Status loop error")
+            log.exception(
+                "Status background loop error"
+            )
 
         time.sleep(STATUS_INTERVAL)
 
@@ -487,7 +562,7 @@ def finish_monitoring_session():
 
         response = backend_session.post(
             finish_url,
-            timeout=20
+            timeout=SESSION_TIMEOUT
         )
 
         if response.status_code in (200, 202):
@@ -500,18 +575,21 @@ def finish_monitoring_session():
         else:
 
             log.error(
-                "Session finalization failed: HTTP %s - %s",
+                "Session finalization failed | HTTP %s | %s",
                 response.status_code,
                 response.text
             )
 
     except requests.RequestException as exc:
 
-        log.error("Session finalization error: %s", exc)
+        log.error(
+            "Session finalization error: %s",
+            exc
+        )
 
 
 # ============================================================
-# 10. FLASK SNAPSHOT PREVIEW
+# 10. FLASK LOCAL SNAPSHOT PREVIEW
 # ============================================================
 
 @app.route("/snapshot")
@@ -530,6 +608,10 @@ def get_snapshot():
         mimetype="image/jpeg"
     )
 
+
+# ============================================================
+# 11. FLASK LOCAL SENDER STATUS
+# ============================================================
 
 @app.route("/status")
 def local_status():
@@ -550,42 +632,70 @@ def local_status():
 
 
 # ============================================================
-# 11. MAIN
+# 12. MAIN
 # ============================================================
 
 if __name__ == "__main__":
 
-    log.info("Starting Hikvision cattle-monitoring sender")
+    log.info(
+        "Starting Hikvision cattle-monitoring sender"
+    )
 
-    log.info("Camera ID: %s", CAMERA_ID)
+    log.info(
+        "Camera IP: %s",
+        CAMERA_IP
+    )
 
-    log.info("Backend: %s", BACKEND_BASE_URL)
+    log.info(
+        "Camera ID: %s",
+        CAMERA_ID
+    )
 
-    if not CAMERA_PASS:
+    log.info(
+        "Backend URL: %s",
+        BACKEND_BASE_URL
+    )
+
+    log.info(
+        "Snapshot interval: %s seconds",
+        SNAPSHOT_INTERVAL
+    )
+
+    log.info(
+        "Heartbeat interval: %s seconds",
+        STATUS_INTERVAL
+    )
+
+    if not CAMERA_PASS or CAMERA_PASS == "YOUR_CAMERA_PASSWORD":
 
         raise RuntimeError(
-            "Set CAMERA_PASS environment variable before starting."
+            "Please enter your Hikvision camera password "
+            "in CAMERA_PASS."
         )
 
+    # Check backend connectivity
     if not check_backend():
 
         raise RuntimeError(
-            "Cattle backend is not reachable. Check URL and server."
+            "Cattle backend is not reachable. "
+            "Check the backend URL and server."
         )
 
-    # Create one monitoring session for this sender run.
+    # Create a monitoring session
     if not create_monitoring_session():
 
         raise RuntimeError(
             "Unable to create monitoring session. "
-            "Check that the camera is registered and enabled."
+            "Verify that the camera is registered and enabled."
         )
 
+    # Start snapshot sender thread
     snapshot_thread = threading.Thread(
         target=snapshot_loop,
         daemon=True
     )
 
+    # Start heartbeat thread
     status_thread = threading.Thread(
         target=status_loop,
         daemon=True
@@ -595,7 +705,9 @@ if __name__ == "__main__":
 
     status_thread.start()
 
-    log.info("Snapshot sender started")
+    log.info(
+        "Snapshot sender and heartbeat threads started"
+    )
 
     try:
 
@@ -608,14 +720,23 @@ if __name__ == "__main__":
 
     except KeyboardInterrupt:
 
-        log.info("Stopping Raspberry Pi sender")
+        log.info(
+            "Stopping Raspberry Pi cattle-monitoring sender"
+        )
 
     finally:
 
         running = False
 
+        # Allow background loops to stop before closing HTTP session
+        snapshot_thread.join(timeout=10)
+
+        status_thread.join(timeout=10)
+
         finish_monitoring_session()
 
         backend_session.close()
 
-        log.info("Sender stopped")
+        log.info(
+            "Raspberry Pi sender stopped"
+        )
