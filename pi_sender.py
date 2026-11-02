@@ -33,7 +33,7 @@ CAMERA_URL = (
 BACKEND_BASE_URL = "http://192.168.137.219:8000"
 
 # Camera ID registered in the cattle-monitoring database
-CAMERA_ID = "HYDERABAD"
+CAMERA_ID = "camera_test_01"
 
 # Snapshot upload interval (seconds)
 SNAPSHOT_INTERVAL = 5
